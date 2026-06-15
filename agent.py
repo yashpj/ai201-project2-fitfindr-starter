@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -30,8 +32,6 @@ def _new_session(query: str, wardrobe: dict) -> dict:
     The session dict is the single source of truth for everything that happens
     during a run — it stores the original query, parsed parameters, tool results,
     and any error that caused early termination.
-
-    You may add fields to this dict as needed for your implementation.
     """
     return {
         "query": query,              # original user query
@@ -42,6 +42,88 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+    }
+
+
+# ── query parser ──────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from the user's natural language query.
+
+    Uses regex patterns:
+    - max_price: "under $30", "under 30", "less than $40", "$25 or less", "max $50"
+    - size: "size M", "size XS", "in M", "in size L"
+    - description: remaining text after stripping price and size clauses
+
+    Returns a dict with keys: description (str), size (str|None), max_price (float|None)
+    """
+    text = query.strip()
+
+    # Extract max_price — try several common patterns
+    price_patterns = [
+        r'(?:under|below|less\s+than|max|no\s+more\s+than)\s*\$?\s*(\d+(?:\.\d+)?)',
+        r'\$\s*(\d+(?:\.\d+)?)\s*(?:or\s+less|max|maximum)',
+    ]
+    max_price = None
+    price_span = None
+    for pattern in price_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            max_price = float(m.group(1))
+            price_span = m.span()
+            break
+
+    # Extract size — patterns like "size M", "in size XL", "in M"
+    size_patterns = [
+        r'(?:in\s+)?size\s+([A-Za-z0-9/]+)',
+        r'\bin\s+([XSML]+)\b',
+    ]
+    size = None
+    size_span = None
+    for pattern in size_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            size = m.group(1).upper()
+            size_span = m.span()
+            break
+
+    # Build description by removing price and size clauses from the query
+    clean = text
+    # Remove size span first (higher index first to avoid offset shift)
+    spans_to_remove = []
+    if price_span:
+        spans_to_remove.append(price_span)
+    if size_span:
+        spans_to_remove.append(size_span)
+
+    # Sort by start position descending so we can remove without shifting
+    spans_to_remove.sort(key=lambda s: s[0], reverse=True)
+    for start, end in spans_to_remove:
+        clean = clean[:start] + " " + clean[end:]
+
+    # Remove common filler phrases that aren't search keywords
+    filler_patterns = [
+        r"i'?m\s+(?:looking|searching)\s+for",
+        r"i\s+(?:want|need|would\s+like)\s+(?:a|an|some)?",
+        r"looking\s+for\s+(?:a|an)?",
+        r"find\s+me\s+(?:a|an)?",
+        r"what(?:'s|\s+is)\s+out\s+there",
+        r"how\s+would\s+i\s+style\s+it",
+        r"i\s+mostly\s+wear.*",
+        r"[,;]\s*$",
+    ]
+    for fp in filler_patterns:
+        clean = re.sub(fp, " ", clean, flags=re.IGNORECASE)
+
+    description = " ".join(clean.split()).strip(" ,.")
+    if not description:
+        description = query.strip()
+
+    return {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
     }
 
 
@@ -62,39 +144,48 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         The session dict after the interaction completes. Check session["error"]
         first — if it is not None, the interaction ended early and the other
         output fields (outfit_suggestion, fit_card) will be None.
-
-    TODO — implement this function using the planning loop you designed in planning.md:
-
-        Step 1: Initialize the session with _new_session().
-
-        Step 2: Parse the user's query to extract a description, size, and
-                max_price. You can use regex, string splitting, or ask the LLM
-                to parse it — document your choice in planning.md.
-                Store the result in session["parsed"].
-
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
-                If no results: set session["error"] to a helpful message and
-                return the session early. Do NOT proceed to suggest_outfit
-                with empty input.
-
-        Step 4: Select the item to use (e.g., the top result).
-                Store it in session["selected_item"].
-
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
-                Store the result in session["outfit_suggestion"].
-
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
-                Store the result in session["fit_card"].
-
-        Step 7: Return the session.
-
-    Before writing code, complete the Planning Loop and State Management sections
-    of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize the session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the query to extract description, size, max_price
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+
+    description = parsed["description"]
+    size = parsed["size"]
+    max_price = parsed["max_price"]
+
+    # Step 3: Call search_listings
+    results = search_listings(description, size=size, max_price=max_price)
+    session["search_results"] = results
+
+    # Branch: no results → set error and return early
+    if not results:
+        parts = [f"No listings found for '{description}'"]
+        if size:
+            parts.append(f"size: {size}")
+        if max_price is not None:
+            parts.append(f"under ${max_price:.0f}")
+        context = " (" + ", ".join(parts[1:]) + ")" if len(parts) > 1 else ""
+        session["error"] = (
+            f"No listings found for '{description}'{context}. "
+            "Try broader keywords, a different size, or raise your price ceiling."
+        )
+        return session
+
+    # Step 4: Select the top result
+    session["selected_item"] = results[0]
+
+    # Step 5: Call suggest_outfit
+    outfit_suggestion = suggest_outfit(session["selected_item"], wardrobe)
+    session["outfit_suggestion"] = outfit_suggestion
+
+    # Step 6: Call create_fit_card
+    fit_card = create_fit_card(outfit_suggestion, session["selected_item"])
+    session["fit_card"] = fit_card
+
+    # Step 7: Return the completed session
     return session
 
 
